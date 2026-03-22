@@ -1,6 +1,7 @@
 """Router: classifies task type and builds agent prompts."""
 
 import json
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -89,6 +90,7 @@ class RoutedTask:
     system_prompt: str
     agent_prompt: str
     use_user_browser: bool
+    output_dir: str | None = None
 
 
 MODEL_MAP = {
@@ -134,9 +136,25 @@ class Router:
             )
             resp.raise_for_status()
             data = resp.json()
-            text = data["content"][0]["text"]
-            result = json.loads(text)
-            task_type = result["type"]
+            text = data["content"][0]["text"].strip()
+
+            # Strip markdown code fences if present
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+                text = re.sub(r"\n?```\s*$", "", text)
+
+            # Extract JSON object if surrounded by other text
+            brace_start = text.find("{")
+            brace_end = text.rfind("}")
+            if brace_start != -1 and brace_end != -1:
+                text = text[brace_start : brace_end + 1]
+
+            try:
+                result = json.loads(text)
+                task_type = result["type"]
+            except (json.JSONDecodeError, KeyError):
+                print(f"    [warn] Could not parse task type from API, raw: {text[:200]}")
+                task_type = "research"
 
         valid_types = set(TASK_TYPES) | {"web_form"}
         if task_type not in valid_types:
@@ -200,4 +218,5 @@ class Router:
             system_prompt=system_prompt,
             agent_prompt=agent_prompt,
             use_user_browser=use_user_browser,
+            output_dir=clarification.get("output_dir"),
         )

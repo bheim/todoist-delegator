@@ -16,6 +16,22 @@ BROWSER_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+OUTPUT_DIR_PATTERN = re.compile(
+    r"output\s*(?:dir(?:ectory)?|path|folder)?\s*:\s*(.+)",
+    re.IGNORECASE,
+)
+
+# Catches natural language like "save to ~/Desktop", "add to my ~/Documents/reports"
+OUTPUT_DIR_NATURAL = re.compile(
+    r"(?:save|add|put|write|place|deliver|export)\s+(?:it\s+|this\s+|files?\s+|output\s+|results?\s+)?(?:as\s+\w+\s+)?(?:to|in|on|into)\s+(?:my\s+)?(~/\S+)",
+    re.IGNORECASE,
+)
+
+OUTPUT_DIR_QUESTION = (
+    "Where should I save the output files? Give a path like `~/Desktop` or `~/Documents/reports`. "
+    "Reply `default` to keep them in the agent workspace."
+)
+
 BROWSER_QUESTION = (
     "This looks like it needs a browser. Should I use your logged-in Chrome session, "
     "or go headless? (reply `my browser` or `headless`)"
@@ -24,12 +40,17 @@ BROWSER_QUESTION = (
 DELEGATOR_HEADER = "🤖 **Delegator**"
 
 QUESTION_SYSTEM_PROMPT = """\
-You are a task clarifier. Given a task description, generate 2-3 short, \
-specific clarifying questions that will help an AI agent execute this task \
-successfully. Focus on ambiguities, missing details, and scope.
+You are a task clarifier. Given a task description, decide whether an AI agent \
+has enough information to execute the task well. Only generate questions if \
+there are genuine ambiguities or missing details that would significantly \
+affect the result. Do NOT ask questions just for the sake of asking.
 
-Respond with ONLY a JSON array of question strings. Example:
-["What format should the output be in?", "Should I include pricing comparisons?"]
+If the task is clear and specific enough to execute, respond with an empty array: []
+
+If clarification is truly needed, generate 1-3 short, specific questions \
+about the most important ambiguities.
+
+Respond with ONLY a JSON array of question strings (or empty array).
 """
 
 
@@ -73,8 +94,24 @@ class Clarifier:
             )
             resp.raise_for_status()
             data = resp.json()
-            text = data["content"][0]["text"]
-            return json.loads(text)
+            text = data["content"][0]["text"].strip()
+
+            # Strip markdown code fences if present
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+                text = re.sub(r"\n?```\s*$", "", text)
+
+            # Try to extract a JSON array if surrounded by other text
+            bracket_start = text.find("[")
+            bracket_end = text.rfind("]")
+            if bracket_start != -1 and bracket_end != -1:
+                text = text[bracket_start : bracket_end + 1]
+
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                print(f"    [warn] Could not parse questions from API, raw: {text[:200]}")
+                return ["What is the desired format for the output?", "Any specific requirements or constraints?"]
 
     def _flatten_comments(self, task_id: str) -> list:
         """Get all comments for a task, flattening paginated results."""
@@ -103,6 +140,18 @@ class Clarifier:
         text = f"{task.content} {task.description}"
         return bool(BROWSER_KEYWORDS.search(text))
 
+    @staticmethod
+    def _extract_output_dir(task: DelegatedTask) -> str | None:
+        """Extract an output directory from task content/description if specified."""
+        for text in [task.content, task.description] + task.comments:
+            match = OUTPUT_DIR_PATTERN.search(text)
+            if match:
+                return match.group(1).strip()
+            match = OUTPUT_DIR_NATURAL.search(text)
+            if match:
+                return match.group(1).strip()
+        return None
+
     def has_existing_clarification(self, task: DelegatedTask) -> bool:
         """Check if this task already has delegator comments from a previous run."""
         return any(c.startswith(DELEGATOR_HEADER) for c in task.comments)
@@ -118,6 +167,7 @@ class Clarifier:
         questions = []
         answers = []
         use_user_browser = False
+        output_dir = self._extract_output_dir(task)
 
         # Walk through comments, pairing questions with the next non-bot answer
         i = 0
@@ -148,6 +198,10 @@ class Clarifier:
                     if question_text.startswith("This looks like it needs a browser"):
                         if "my browser" in next_c.lower():
                             use_user_browser = True
+                    # Check output dir choice
+                    if question_text.startswith("Where should I save the output"):
+                        if next_c.strip().lower() != "default":
+                            output_dir = next_c.strip()
                     i += 1
                     break
                 if not found_answer:
@@ -163,24 +217,43 @@ class Clarifier:
             "answers": answers,
             "skipped": skipped,
             "use_user_browser": use_user_browser,
+            "output_dir": output_dir,
         }
 
     async def clarify(self, task: DelegatedTask) -> dict:
         """Run the full clarification flow: generate questions, post as comments, wait for replies."""
+        # Generate questions — may return empty if task is clear enough
+        questions = await self._generate_questions(task)
+
+        # Check if output directory was already specified in the task
+        output_dir = self._extract_output_dir(task)
+
+        # Append browser session question if task looks like browser work
+        looks_like_browser = self._looks_like_browser_task(task)
+        if looks_like_browser:
+            questions.append(BROWSER_QUESTION)
+
+        # Ask where to save output if not already specified
+        if not output_dir:
+            questions.append(OUTPUT_DIR_QUESTION)
+
+        # If no questions to ask, skip the whole clarification flow
+        if not questions:
+            return {
+                "task": task,
+                "questions": [],
+                "answers": [],
+                "skipped": False,
+                "use_user_browser": False,
+                "output_dir": output_dir,
+            }
+
         # Post a header comment
         self.todoist.add_comment(
             task_id=task.task_id,
             content=f"{DELEGATOR_HEADER}: I have a few clarifying questions before I start. "
             "Reply to each with a comment. Reply \"skip\" to skip remaining questions.",
         )
-
-        # Generate questions
-        questions = await self._generate_questions(task)
-
-        # Append browser session question if task looks like browser work
-        looks_like_browser = self._looks_like_browser_task(task)
-        if looks_like_browser:
-            questions.append(BROWSER_QUESTION)
 
         answers = []
         skipped = False
@@ -212,6 +285,9 @@ class Clarifier:
                 # Parse browser session choice
                 if q == BROWSER_QUESTION and "my browser" in reply.lower():
                     use_user_browser = True
+                # Parse output directory choice
+                if q == OUTPUT_DIR_QUESTION and reply.strip().lower() != "default":
+                    output_dir = reply.strip()
 
         return {
             "task": task,
@@ -219,4 +295,5 @@ class Clarifier:
             "answers": answers,
             "skipped": skipped,
             "use_user_browser": use_user_browser,
+            "output_dir": output_dir,
         }

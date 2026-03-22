@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import shutil as _shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -140,6 +141,18 @@ class Dispatcher:
             for f in task_dir.rglob("*"):
                 if f.is_file():
                     output_files.append(str(f))
+
+        # Copy output files to user-specified directory if provided
+        if routed.output_dir and output_files:
+            dest = Path(os.path.expanduser(routed.output_dir)).resolve()
+            dest.mkdir(parents=True, exist_ok=True)
+            copied_files = []
+            for f in output_files:
+                src = Path(f)
+                target = dest / src.name
+                _shutil.copy2(str(src), str(target))
+                copied_files.append(str(target))
+            output_files = copied_files
 
         summary = assistant_texts[-1] if assistant_texts else "(no output)"
 
