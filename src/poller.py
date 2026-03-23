@@ -7,7 +7,7 @@ import httpx
 from todoist_api_python.api import TodoistAPI
 
 from .config import Config
-from .state import TaskState
+from .state import SKIP_STATUSES, TaskState
 
 
 @dataclass
@@ -78,7 +78,7 @@ class Poller:
         result = []
 
         for task in tasks:
-            if self.state.status(task.id) in ("completed", "failed", "waiting_for_human"):
+            if self.state.status(task.id) in SKIP_STATUSES:
                 continue
 
             print(f"  Fetching details for: {task.content}", flush=True)
@@ -119,10 +119,40 @@ class Poller:
 
         return result
 
+    def poll_by_id(self, task_id: str) -> list[DelegatedTask]:
+        """Fetch a single task by ID. Returns a list with 0 or 1 elements."""
+        try:
+            task = self.api.get_task(task_id=task_id)
+        except Exception:
+            return []
+
+        project_name = ""
+        if task.project_id:
+            try:
+                project = self.api.get_project(task.project_id)
+                project_name = project.name
+            except Exception:
+                pass
+
+        raw_comments = []
+        try:
+            raw_comments = self._flatten(self.api.get_comments(task_id=task.id))
+        except Exception:
+            pass
+
+        comment_texts = [c.content for c in raw_comments]
+        attachments = self._download_attachments(task.id, raw_comments)
+
+        return [DelegatedTask(
+            task_id=task.id,
+            content=task.content,
+            description=task.description or "",
+            project_name=project_name,
+            labels=task.labels,
+            comments=comment_texts,
+            attachments=attachments,
+        )]
+
     def complete_task(self, task_id: str) -> None:
         """Mark a task as complete."""
         self.api.complete_task(task_id=task_id)
-
-    def add_comment(self, task_id: str, content: str) -> None:
-        """Add a comment to a task."""
-        self.api.add_comment(task_id=task_id, content=content)

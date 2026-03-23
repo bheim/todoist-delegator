@@ -8,32 +8,33 @@ import httpx
 
 from .config import Config
 
+ALL_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch"]
+
 TASK_TYPES = {
     "research": {
-        "tools": ["Bash", "WebSearch", "Read", "Write"],
         "system_prompt": (
-            "You are a research assistant. Find information, compare options, "
-            "and produce a clear, well-organized summary. Save your findings "
-            "to a file in the working directory."
+            "You are a capable assistant. Your primary goal is to find information, "
+            "compare options, and produce a clear summary. Use all tools at your disposal — "
+            "search the web, run shell commands, read and write files. "
+            "Actually do the work; do not just describe steps for the user to follow."
         ),
     },
     "writing": {
-        "tools": ["Read", "Write", "Edit", "WebSearch"],
         "system_prompt": (
-            "You are a writing assistant. Draft polished, professional content. "
+            "You are a capable assistant. Your primary goal is to draft polished, "
+            "professional content. Use all tools at your disposal. "
             "Save your output to a file in the working directory."
         ),
     },
     "code": {
-        "tools": ["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
         "system_prompt": (
-            "You are a coding assistant. Write clean, well-structured code. "
-            "Test your work when possible. Save all code to files in the working directory."
+            "You are a capable assistant. Your primary goal is to write code, set up projects, "
+            "configure infrastructure, or solve technical problems. Use all tools at your disposal — "
+            "run shell commands, install packages, clone repos, SSH into servers, etc. "
+            "Actually do the work; do not just write instructions for the user to follow."
         ),
     },
 }
-
-WEB_FORM_TOOLS = ["Bash", "Read", "Write"]
 
 WEB_FORM_USER_BROWSER_PROMPT = """\
 You are a web automation specialist using the user's authenticated Chrome session.
@@ -71,7 +72,7 @@ IMPORTANT: Always pass --headed to `agent-browser open` so the browser window is
 """
 
 CLASSIFIER_SYSTEM_PROMPT = """\
-You are a task classifier. Given a task description and clarification context, \
+You are a task classifier. Given a task description and its execution plan, \
 classify it into exactly one of these types: research, writing, code, web_form.
 
 - research: finding information, comparing options, market analysis
@@ -106,17 +107,14 @@ class Router:
         self.model = MODEL_MAP.get(config.agent_model, config.agent_model)
         self.chrome_profile_path = config.chrome_profile_path
 
-    async def classify(self, clarification: dict) -> str:
+    async def classify(self, plan_context: dict) -> str:
         """Classify the task into a type using Claude API."""
-        task = clarification["task"]
+        task = plan_context["task"]
         context = f"Task: {task.content}"
         if task.description:
             context += f"\nDescription: {task.description}"
-        if clarification["questions"] and clarification["answers"]:
-            qa_pairs = zip(clarification["questions"], clarification["answers"])
-            context += "\n\nClarification Q&A:"
-            for q, a in qa_pairs:
-                context += f"\nQ: {q}\nA: {a}"
+        if plan_context.get("plan"):
+            context += f"\n\nExecution plan:\n{plan_context['plan']}"
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -161,9 +159,9 @@ class Router:
             task_type = "research"
         return task_type
 
-    def build_prompt(self, clarification: dict) -> str:
-        """Assemble the full agent prompt from task context and Q&A."""
-        task = clarification["task"]
+    def build_prompt(self, plan_context: dict) -> str:
+        """Assemble the full agent prompt from task context and plan."""
+        task = plan_context["task"]
         parts = [f"# Task\n{task.content}"]
 
         if task.description:
@@ -172,11 +170,8 @@ class Router:
         if task.comments:
             parts.append("## Existing Comments\n" + "\n".join(f"- {c}" for c in task.comments))
 
-        if clarification["questions"] and clarification["answers"]:
-            qa_section = "## Clarification Q&A"
-            for q, a in zip(clarification["questions"], clarification["answers"]):
-                qa_section += f"\n**Q:** {q}\n**A:** {a}"
-            parts.append(qa_section)
+        if plan_context.get("plan"):
+            parts.append(f"## Execution Plan\n{plan_context['plan']}")
 
         if task.attachments:
             att_section = "## Attached Files\nThe following files have been downloaded to your working directory:"
@@ -186,19 +181,21 @@ class Router:
 
         parts.append(
             "\n## Instructions\n"
-            "Complete this task thoroughly. Save all output files to the current working directory. "
-            "When finished, provide a clear summary of what you did and any output files created."
+            "Follow the execution plan above. Actually do the work — run commands, install software, "
+            "download files, configure systems, etc. Do NOT just write markdown instructions or "
+            "step-by-step guides for the user to follow. Save all output files to the current "
+            "working directory. When finished, provide a clear summary of what you did."
         )
 
         return "\n\n".join(parts)
 
-    async def route(self, clarification: dict) -> RoutedTask:
+    async def route(self, plan_context: dict) -> RoutedTask:
         """Classify the task and build the routed task with tools and prompts."""
-        task_type = await self.classify(clarification)
-        use_user_browser = clarification.get("use_user_browser", False)
+        task_type = await self.classify(plan_context)
+        use_user_browser = plan_context.get("use_user_browser", False)
 
         if task_type == "web_form":
-            tools = WEB_FORM_TOOLS
+            tools = ALL_TOOLS
             if use_user_browser:
                 system_prompt = WEB_FORM_USER_BROWSER_PROMPT.format(
                     chrome_profile_path=self.chrome_profile_path
@@ -207,10 +204,10 @@ class Router:
                 system_prompt = WEB_FORM_HEADLESS_PROMPT
         else:
             type_config = TASK_TYPES[task_type]
-            tools = type_config["tools"]
+            tools = ALL_TOOLS
             system_prompt = type_config["system_prompt"]
 
-        agent_prompt = self.build_prompt(clarification)
+        agent_prompt = self.build_prompt(plan_context)
 
         return RoutedTask(
             task_type=task_type,
@@ -218,5 +215,5 @@ class Router:
             system_prompt=system_prompt,
             agent_prompt=agent_prompt,
             use_user_browser=use_user_browser,
-            output_dir=clarification.get("output_dir"),
+            output_dir=plan_context.get("output_dir"),
         )

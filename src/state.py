@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Any
 
 # Task lifecycle:
-#   new → clarifying → processing → completed
-#                                  → failed
-#                                  → waiting_for_human → processing → ...
+#   new → planning → awaiting_approval → processing → awaiting_review → completed
+#                  ↘ conversing ↗       ↘ conversing ↗  → failed
+#                                                       → waiting_for_human → processing → ...
 
 TERMINAL_STATUSES = {"completed", "failed"}
-SKIP_STATUSES = {"completed", "failed", "waiting_for_human"}
+SKIP_STATUSES = {"completed", "failed", "waiting_for_human", "awaiting_approval", "awaiting_review", "conversing"}
 
 
 class TaskState:
@@ -37,48 +37,87 @@ class TaskState:
     def is_finished(self, task_id: str) -> bool:
         return self.status(task_id) in TERMINAL_STATUSES
 
-    def set_clarifying(self, task_id: str) -> None:
-        self._data[task_id] = {"status": "clarifying"}
+    def set_planning(self, task_id: str) -> None:
+        self._data[task_id] = {"status": "planning"}
         self._save()
 
-    def set_processing(self, task_id: str, clarification: dict) -> None:
-        """Mark task as processing and store clarification data for resume."""
-        # Store a serializable copy (strip the DelegatedTask object)
-        serializable = {
-            "questions": clarification["questions"],
-            "answers": clarification["answers"],
-            "skipped": clarification["skipped"],
-            "use_user_browser": clarification.get("use_user_browser", False),
-        }
+    def set_awaiting_approval(self, task_id: str, plan_text: str) -> None:
         self._data[task_id] = {
-            "status": "processing",
-            "clarification": serializable,
+            "status": "awaiting_approval",
+            "plan": plan_text,
         }
+        self._save()
+
+    def set_processing(self, task_id: str, plan_context: dict, human_completed: str = "") -> None:
+        """Mark task as processing and store plan context for resume."""
+        entry = {
+            "status": "processing",
+            "plan": plan_context["plan"],
+            "use_user_browser": plan_context.get("use_user_browser", False),
+            "output_dir": plan_context.get("output_dir"),
+        }
+        if human_completed:
+            entry["human_completed"] = human_completed
+        self._data[task_id] = entry
+        self._save()
+
+    def set_awaiting_review(self, task_id: str, plan_context: dict | None = None) -> None:
+        entry: dict[str, Any] = {"status": "awaiting_review"}
+        if plan_context:
+            entry["plan"] = plan_context["plan"]
+            entry["use_user_browser"] = plan_context.get("use_user_browser", False)
+            entry["output_dir"] = plan_context.get("output_dir")
+        self._data[task_id] = entry
         self._save()
 
     def set_completed(self, task_id: str) -> None:
-        entry = self._data.get(task_id, {})
-        entry["status"] = "completed"
-        entry.pop("clarification", None)
-        self._data[task_id] = entry
+        self._data[task_id] = {"status": "completed"}
         self._save()
 
     def is_waiting(self, task_id: str) -> bool:
         return self.status(task_id) == "waiting_for_human"
 
-    def set_waiting_for_human(self, task_id: str, message: str, clarification: dict | None = None) -> None:
-        entry = self._data.get(task_id, {})
-        entry["status"] = "waiting_for_human"
-        entry["waiting_message"] = message
-        if clarification:
-            entry["clarification"] = clarification
+    def set_waiting_for_human(self, task_id: str, message: str, plan_context: dict | None = None) -> None:
+        entry = {
+            "status": "waiting_for_human",
+            "waiting_message": message,
+        }
+        if plan_context:
+            entry["plan"] = plan_context["plan"]
+            entry["use_user_browser"] = plan_context.get("use_user_browser", False)
+            entry["output_dir"] = plan_context.get("output_dir")
         self._data[task_id] = entry
         self._save()
 
+    def set_conversing(self, task_id: str, from_status: str, plan_context: dict,
+                       task_content: str, conversation_history: list[dict] | None = None) -> None:
+        """Enter conversing state — user is chatting with LLM to refine requirements."""
+        self._data[task_id] = {
+            "status": "conversing",
+            "from_status": from_status,  # "awaiting_approval" or "awaiting_review"
+            "plan": plan_context.get("plan", ""),
+            "use_user_browser": plan_context.get("use_user_browser", False),
+            "output_dir": plan_context.get("output_dir"),
+            "task_content": task_content,
+            "conversation_history": conversation_history or [],
+        }
+        self._save()
+
+    def append_conversation(self, task_id: str, role: str, content) -> None:
+        """Append a message to the conversation history.
+
+        content can be a plain string or a list of content blocks (for assistant
+        turns that include tool use like web_search).
+        """
+        entry = self._data.get(task_id)
+        if entry and entry.get("status") == "conversing":
+            entry.setdefault("conversation_history", []).append(
+                {"role": role, "content": content}
+            )
+            self._save()
+
     def set_failed(self, task_id: str, error: str = "") -> None:
-        entry = self._data.get(task_id, {})
-        entry["status"] = "failed"
-        entry.pop("clarification", None)
+        entry: dict[str, Any] = {"status": "failed"}
         if error:
             entry["error"] = error
         self._data[task_id] = entry

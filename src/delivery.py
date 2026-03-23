@@ -1,32 +1,35 @@
-"""Delivery: posts results as Todoist comments and marks tasks complete."""
+"""Delivery: sends results via Telegram and marks Todoist tasks complete."""
 
 from .dispatcher import DispatchResult
 from .poller import Poller
 from .state import TaskState
+from .telegram import TelegramBot
 
 
 class Delivery:
-    def __init__(self, poller: Poller, state: TaskState):
+    def __init__(self, poller: Poller, state: TaskState, telegram: TelegramBot):
         self.poller = poller
         self.state = state
+        self.telegram = telegram
 
-    def deliver(self, task_id: str, task_content: str, result: DispatchResult) -> None:
-        """Post results as a Todoist comment and complete the task if successful."""
-        status = "Completed" if result.success else "Failed"
-
-        file_list = "\n".join(f"- `{f}`" for f in result.output_files) if result.output_files else "(none)"
-
-        comment = (
-            f"🤖 **Delegator Result: {status}**\n\n"
-            f"**Summary:**\n{result.summary}\n\n"
-            f"**Output files:**\n{file_list}\n\n"
-            f"**Cost:** ${result.cost_usd:.4f}"
+    async def send_for_review(self, task_id: str, task_content: str, result: DispatchResult,
+                              plan_context: dict | None = None) -> None:
+        """Send results via Telegram and wait for human to approve before completing."""
+        await self.telegram.send_result(
+            task_id=task_id,
+            task_title=task_content,
+            success=result.success,
+            summary=result.summary,
+            output_files=result.output_files,
+            cost_usd=result.cost_usd,
         )
 
-        self.poller.add_comment(task_id, comment)
-
         if result.success:
-            self.poller.complete_task(task_id)
-            self.state.set_completed(task_id)
+            self.state.set_awaiting_review(task_id, plan_context)
         else:
             self.state.set_failed(task_id, result.summary)
+
+    def complete(self, task_id: str) -> None:
+        """Mark task as complete in Todoist after human approval."""
+        self.poller.complete_task(task_id)
+        self.state.set_completed(task_id)

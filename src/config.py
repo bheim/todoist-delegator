@@ -21,6 +21,8 @@ class Config:
     # Required
     todoist_api_token: str = ""
     anthropic_api_key: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     # Optional with defaults
     chrome_profile_path: str = ""
@@ -34,6 +36,8 @@ class Config:
         default_factory=lambda: [
             "todoist_api_token",
             "anthropic_api_key",
+            "telegram_bot_token",
+            "telegram_chat_id",
         ],
         repr=False,
     )
@@ -50,6 +54,8 @@ def load_config() -> Config:
     return Config(
         todoist_api_token=os.getenv("TODOIST_API_TOKEN", ""),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         chrome_profile_path=os.path.expanduser(
             os.getenv("CHROME_PROFILE_PATH", _default_chrome_profile())
         ),

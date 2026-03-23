@@ -4,99 +4,250 @@ import asyncio
 import sys
 from pathlib import Path
 
-from todoist_api_python.api import TodoistAPI
-
 from .config import load_config
 from .state import TaskState
 from .poller import Poller
-from .clarifier import Clarifier
+from .planner import Planner
 from .router import Router
 from .dispatcher import Dispatcher, DispatchResult
 from .delivery import Delivery
+from .telegram import TelegramBot
+from .chatbot import Chatbot
+
+APPROVAL_WORDS = {"go", "ok", "yes", "approve", "approved", "lgtm", "looks good", "done"}
 
 
-async def process_task(task, state, clarifier, router, dispatcher, delivery):
-    """Process a single delegated task, resuming at the right stage."""
-    task_status = state.status(task.task_id)
+async def execute_task(task, config, state, planner, router, dispatcher, delivery, telegram):
+    """Execute a task that has already been planned and approved (status=processing)."""
+    saved = state.get(task.task_id)
+    plan_context = {
+        "task": task,
+        "plan": saved["plan"],
+        "use_user_browser": saved.get("use_user_browser", False),
+        "output_dir": saved.get("output_dir"),
+    }
+    human_completed = saved.get("human_completed", "")
 
-    # --- Stage 1: Clarification ---
-    if task_status == "processing":
-        # Already clarified — restore saved clarification data
-        saved = state.get(task.task_id)
-        clarification = saved["clarification"]
-        clarification["task"] = task  # re-attach live task object
-        print(f"[+] Resuming task: {task.content} (id={task.task_id}) — skipping clarification")
-    elif task_status == "clarifying":
-        # Was mid-clarification — check if answers already exist in comments
-        if clarifier.has_existing_clarification(task):
-            print(f"[+] Resuming task: {task.content} (id={task.task_id}) — parsing existing Q&A")
-            clarification = clarifier.parse_existing_clarification(task)
-        else:
-            print(f"[+] Re-clarifying task: {task.content} (id={task.task_id})")
-            state.set_clarifying(task.task_id)
-            clarification = await clarifier.clarify(task)
-    else:
-        # New task (or first run with no state file)
-        if clarifier.has_existing_clarification(task):
-            print(f"[+] Found existing Q&A for: {task.content} (id={task.task_id})")
-            clarification = clarifier.parse_existing_clarification(task)
-        else:
-            print(f"[+] New task: {task.content} (id={task.task_id})")
-            state.set_clarifying(task.task_id)
-            print("    Clarifying...")
-            clarification = await clarifier.clarify(task)
+    # --- Route ---
+    print(f"    Classifying task type...")
+    state.set_processing(task.task_id, plan_context)
+    routed = await router.route(plan_context)
 
-    # --- Stage 2: Route ---
-    print("    Classifying task type...")
-    state.set_processing(task.task_id, clarification)
-    routed = await router.route(clarification)
+    if human_completed:
+        routed.agent_prompt += (
+            f"\n\n## Resume After Human Action\n"
+            f"A previous agent run requested human help: \"{human_completed}\"\n"
+            f"The human has confirmed they completed this action. "
+            f"Continue from where the previous run left off — do NOT repeat the request for human help. "
+            f"The action has already been done."
+        )
+
     print(f"    Type: {routed.task_type}")
 
-    # --- Stage 3: Dispatch ---
+    # --- Dispatch ---
     print("    Dispatching to agent...")
     result = await dispatcher.dispatch(task.task_id, routed)
     print(f"    Agent finished: success={result.success}, cost=${result.cost_usd:.4f}")
 
-    # --- Stage 3b: Check if agent needs human help ---
+    # --- Check if agent needs human help ---
     if result.needs_human:
         print(f"    Agent needs human help: {result.needs_human}")
-        saved = state.get(task.task_id)
-        clarification_data = saved.get("clarification") if saved else None
-        state.set_waiting_for_human(task.task_id, result.needs_human, clarification_data)
-        # Post comment to Todoist telling the user what to do
-        delivery.poller.add_comment(
-            task.task_id,
-            f"🖐️ **Action needed:** {result.needs_human}\n\n"
-            f"When you're done, reply `done` here and I'll continue.",
-        )
+        await telegram.send_needs_human(task.task_id, task.content, result.needs_human)
+        state.set_waiting_for_human(task.task_id, result.needs_human, plan_context)
         return
 
-    # --- Stage 4: Deliver ---
-    print("    Delivering results...")
-    delivery.deliver(task.task_id, task.content, result)
-    print(f"[+] Done: {task.content}")
+    # --- Send for review ---
+    print("    Sending results for review...")
+    await delivery.send_for_review(task.task_id, task.content, result, plan_context)
+    print(f"[+] Awaiting review: {task.content}")
 
 
-def check_waiting_tasks(state: TaskState, todoist: TodoistAPI) -> list[str]:
-    """Check waiting_for_human tasks for a 'done' reply. Returns task IDs ready to resume."""
-    ready = []
-    for task_id, entry in state._data.items():
-        if entry.get("status") != "waiting_for_human":
-            continue
-        # Check recent comments for "done"
-        try:
-            comments = []
-            for page in todoist.get_comments(task_id=task_id):
-                comments.extend(page)
-            # Look at the last few comments for a "done" reply
-            for c in comments[-5:]:
-                content = c.content.strip().lower()
-                if content == "done" or content.startswith("done"):
-                    ready.append(task_id)
-                    break
-        except Exception:
-            pass
-    return ready
+async def handle_new_task(task, state, planner, telegram):
+    """Generate a plan for a new task and send it to Telegram for approval."""
+    print(f"[+] New task: {task.content} (id={task.task_id})")
+    state.set_planning(task.task_id)
+    print("    Generating plan...")
+    plan_text = await planner.generate_plan(task)
+    planner.save_plan(task.task_id, plan_text)
+    await telegram.send_plan(task.task_id, task.content, plan_text)
+    state.set_awaiting_approval(task.task_id, plan_text)
+    print("    Plan sent to Telegram, awaiting approval.")
+
+
+async def handle_telegram_reply(reply, state, telegram, delivery, planner, poller, chatbot):
+    """Route a single Telegram reply to the right task based on current states."""
+    content = reply.strip().lower()
+    is_approval = content in APPROVAL_WORDS
+
+    # Priority 0: conversing tasks (ongoing LLM chat)
+    convo_ids = [
+        task_id for task_id, entry in state._data.items()
+        if entry.get("status") == "conversing"
+    ]
+    if convo_ids:
+        task_id = convo_ids[0]
+        saved = state.get(task_id)
+        if is_approval:
+            # User says "go" — extract refined context and transition
+            from_status = saved.get("from_status", "awaiting_approval")
+            plan_context = {
+                "plan": saved.get("plan", ""),
+                "use_user_browser": saved.get("use_user_browser", False),
+                "output_dir": saved.get("output_dir"),
+            }
+            # Summarize conversation into additional context for the plan
+            history = saved.get("conversation_history", [])
+            if history:
+                lines = []
+                for m in history:
+                    label = "User" if m["role"] == "user" else "Assistant"
+                    content = m["content"]
+                    # Assistant content may be a list of blocks (from web_search turns)
+                    if isinstance(content, list):
+                        text = " ".join(
+                            b["text"] for b in content
+                            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                        )
+                    else:
+                        text = content
+                    if text:
+                        lines.append(f"{label}: {text}")
+                convo_summary = "\n".join(lines)
+                plan_context["plan"] += f"\n\n## Refined requirements from conversation\n{convo_summary}"
+
+            if from_status == "awaiting_review":
+                print(f"[+] Conversation done for task {task_id} — re-running agent")
+                state.set_processing(task_id, plan_context)
+                await telegram.send_message("Got it — re-running the agent with your refined requirements.")
+            else:
+                print(f"[+] Conversation done for task {task_id} — approved, moving to processing")
+                state.set_processing(task_id, plan_context)
+                await telegram.send_message("Got it — launching the agent now.")
+        else:
+            # Continue the conversation with the LLM
+            print(f"[+] Chatting about task {task_id}: {reply[:80]}")
+            state.append_conversation(task_id, "user", reply)
+            try:
+                display_text, raw_content = await chatbot.chat(
+                    task_content=saved.get("task_content", ""),
+                    plan=saved.get("plan", ""),
+                    conversation_history=saved.get("conversation_history", []),
+                    from_status=saved.get("from_status", ""),
+                )
+                state.append_conversation(task_id, "assistant", raw_content)
+                await telegram.send_message(display_text)
+            except Exception as e:
+                await telegram.send_message(f"Chat error: {e}\nYou can keep chatting or say \"go\" to proceed.")
+        return
+
+    # Priority 1: awaiting_approval tasks
+    approval_ids = [
+        task_id for task_id, entry in state._data.items()
+        if entry.get("status") == "awaiting_approval"
+    ]
+    if approval_ids:
+        task_id = approval_ids[0]
+        saved = state.get(task_id)
+        if is_approval:
+            print(f"[+] Plan approved for task {task_id}")
+            # Fetch task object to check browser/output dir
+            tasks = poller.poll_by_id(task_id)
+            if tasks:
+                task = tasks[0]
+                plan_context = {
+                    "plan": saved["plan"],
+                    "use_user_browser": planner.looks_like_browser_task(task),
+                    "output_dir": planner.extract_output_dir(task),
+                }
+            else:
+                plan_context = {
+                    "plan": saved["plan"],
+                    "use_user_browser": False,
+                    "output_dir": None,
+                }
+            state.set_processing(task_id, plan_context)
+        else:
+            # Feedback — enter conversation mode instead of immediately regenerating
+            print(f"[+] Starting conversation about plan for task {task_id}")
+            tasks = poller.poll_by_id(task_id)
+            task_content = tasks[0].content if tasks else ""
+            plan_context = {
+                "plan": saved.get("plan", ""),
+                "use_user_browser": False,
+                "output_dir": None,
+            }
+            state.set_conversing(task_id, "awaiting_approval", plan_context, task_content)
+            state.append_conversation(task_id, "user", reply)
+            try:
+                display_text, raw_content = await chatbot.chat(
+                    task_content=task_content,
+                    plan=saved.get("plan", ""),
+                    conversation_history=[{"role": "user", "content": reply}],
+                    from_status="awaiting_approval",
+                )
+                state.append_conversation(task_id, "assistant", raw_content)
+                await telegram.send_message(display_text)
+            except Exception as e:
+                await telegram.send_message(f"Chat error: {e}\nYou can keep chatting or say \"go\" to proceed.")
+        return
+
+    # Priority 2: waiting_for_human tasks
+    waiting_ids = [
+        task_id for task_id, entry in state._data.items()
+        if entry.get("status") == "waiting_for_human"
+    ]
+    if waiting_ids and is_approval:
+        for task_id in waiting_ids:
+            print(f"[+] Human confirmed done for task {task_id} — resuming")
+            saved = state.get(task_id)
+            human_completed = saved.get("waiting_message", "")
+            plan_context = {
+                "plan": saved.get("plan", ""),
+                "use_user_browser": saved.get("use_user_browser", False),
+                "output_dir": saved.get("output_dir"),
+            }
+            state.set_processing(task_id, plan_context, human_completed=human_completed)
+        return
+
+    # Priority 3: awaiting_review tasks
+    review_ids = [
+        task_id for task_id, entry in state._data.items()
+        if entry.get("status") == "awaiting_review"
+    ]
+    if review_ids:
+        if is_approval:
+            for task_id in review_ids:
+                print(f"[+] Human approved result for task {task_id} — completing")
+                delivery.complete(task_id)
+                await telegram.send_message(f"Task `{task_id}` marked complete.")
+        else:
+            # Enter conversation mode to refine requirements before re-running
+            for task_id in review_ids:
+                print(f"[+] Starting conversation about results for task {task_id}")
+                saved = state.get(task_id)
+                task_content = saved.get("task_content", "")
+                # Try to get task content from Todoist if not in state
+                if not task_content:
+                    tasks = poller.poll_by_id(task_id)
+                    task_content = tasks[0].content if tasks else ""
+                plan_context = {
+                    "plan": saved.get("plan", ""),
+                    "use_user_browser": saved.get("use_user_browser", False),
+                    "output_dir": saved.get("output_dir"),
+                }
+                state.set_conversing(task_id, "awaiting_review", plan_context, task_content)
+                state.append_conversation(task_id, "user", reply)
+                try:
+                    display_text, raw_content = await chatbot.chat(
+                        task_content=task_content,
+                        plan=saved.get("plan", ""),
+                        conversation_history=[{"role": "user", "content": reply}],
+                        from_status="awaiting_review",
+                    )
+                    state.append_conversation(task_id, "assistant", raw_content)
+                    await telegram.send_message(display_text)
+                except Exception as e:
+                    await telegram.send_message(f"Chat error: {e}\nYou can keep chatting or say \"go\" to proceed.")
 
 
 async def main():
@@ -118,48 +269,37 @@ async def main():
     print(f"  State file: {state_file}")
     print()
 
+    telegram = TelegramBot(config)
     poller = Poller(config, state)
-    clarifier = Clarifier(config)
+    planner = Planner(config)
     router = Router(config)
-    dispatcher = Dispatcher(config)
-    delivery = Delivery(poller, state)
-    todoist = TodoistAPI(config.todoist_api_token)
+    dispatcher = Dispatcher(config, telegram)
+    delivery = Delivery(poller, state, telegram)
+    chatbot = Chatbot(config)
 
     while True:
         try:
-            # Check if any waiting tasks got a "done" reply
-            ready_ids = check_waiting_tasks(state, todoist)
-            for task_id in ready_ids:
-                print(f"[+] Human confirmed done for task {task_id} — resuming")
-                # Move back to processing so the poller picks it up
-                saved = state.get(task_id)
-                clarification = saved.get("clarification")
-                if clarification:
-                    state.set_processing(task_id, clarification)
-                else:
-                    state.set_clarifying(task_id)
+            # Single place to check Telegram replies — routes to the right handler
+            reply = await telegram.poll_for_reply(timeout=2.0)
+            if reply:
+                await handle_telegram_reply(reply, state, telegram, delivery, planner, poller, chatbot)
 
             # Poll for new/resumable tasks
             tasks = poller.poll()
             if tasks:
                 print(f"Found {len(tasks)} task(s) to process")
             for task in tasks:
+                task_status = state.status(task.task_id)
                 try:
-                    await process_task(task, state, clarifier, router, dispatcher, delivery)
+                    if task_status == "processing":
+                        await execute_task(task, config, state, planner, router, dispatcher, delivery, telegram)
+                    elif task_status is None:
+                        await handle_new_task(task, state, planner, telegram)
                 except Exception as e:
                     print(f"[!] Error processing task {task.task_id}: {e}")
                     state.set_failed(task.task_id, str(e))
                     try:
-                        delivery.deliver(
-                            task.task_id,
-                            task.content,
-                            DispatchResult(
-                                success=False,
-                                summary=f"Error: {e}",
-                                output_files=[],
-                                cost_usd=0.0,
-                            ),
-                        )
+                        await telegram.send_error(task.task_id, task.content, str(e))
                     except Exception:
                         pass
 
