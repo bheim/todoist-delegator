@@ -1,6 +1,7 @@
 """Todoist poller for tasks with the @delegate label."""
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -71,14 +72,27 @@ class Poller:
 
         return downloaded
 
+    def _is_due_today_or_overdue(self, task) -> bool:
+        """Return True if the task is due today or overdue (no due date = skip)."""
+        if not task.due:
+            return False
+        try:
+            due_date = date.fromisoformat(str(task.due.date)[:10])
+        except (ValueError, TypeError):
+            return False
+        return due_date <= date.today()
+
     def poll(self) -> list[DelegatedTask]:
-        """Poll for tasks matching the delegate label, skipping finished ones."""
+        """Poll for tasks matching the delegate label that are due today or overdue."""
         print("  Polling Todoist...", flush=True)
         tasks = self._flatten(self.api.get_tasks(label=self.label_name))
         result = []
 
         for task in tasks:
             if self.state.status(task.id) in SKIP_STATUSES:
+                continue
+
+            if not self._is_due_today_or_overdue(task):
                 continue
 
             print(f"  Fetching details for: {task.content}", flush=True)

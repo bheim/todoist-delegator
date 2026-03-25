@@ -4,3 +4,4 @@ agent-workspace/
 __pycache__/
 *.pyc
 CLAUDE.md
+*.log

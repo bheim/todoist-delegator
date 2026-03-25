@@ -28,7 +28,7 @@ class Config:
     chrome_profile_path: str = ""
     delegate_label_name: str = "delegate"
     poll_interval_seconds: int = 30
-    agent_model: str = "sonnet"
+    agent_model: str = "haiku"
     agent_max_turns: int = 50
     working_dir: str = "./agent-workspace"
 
@@ -61,7 +61,7 @@ def load_config() -> Config:
         ),
         delegate_label_name=os.getenv("DELEGATE_LABEL_NAME", "delegate"),
         poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "30")),
-        agent_model=os.getenv("AGENT_MODEL", "sonnet"),
+        agent_model=os.getenv("AGENT_MODEL", "haiku"),
         agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "50")),
         working_dir=os.path.abspath(
             os.getenv("WORKING_DIR", "./agent-workspace")

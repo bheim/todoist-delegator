@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Setup script for Todoist Delegator."""
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
+import urllib.error
 import venv
+import webbrowser
 
 
 def run(cmd, **kwargs):
@@ -15,37 +20,6 @@ def run(cmd, **kwargs):
         print(f"  FAILED (exit code {result.returncode})")
         return False
     return True
-
-
-# Each entry: (ENV_VAR_NAME, prompt text, help text shown before prompting)
-REQUIRED_CONFIG = [
-    (
-        "TODOIST_API_TOKEN",
-        "Todoist API token",
-        "  Get yours at: https://app.todoist.com/app/settings/integrations/developer",
-    ),
-    (
-        "ANTHROPIC_API_KEY",
-        "Anthropic API key",
-        "  Get yours at: https://console.anthropic.com/",
-    ),
-    (
-        "TELEGRAM_BOT_TOKEN",
-        "Telegram bot token",
-        "  To create a bot:\n"
-        "    1. Open Telegram and message @BotFather\n"
-        "    2. Send /newbot and follow the prompts\n"
-        "    3. Copy the token it gives you",
-    ),
-    (
-        "TELEGRAM_CHAT_ID",
-        "Telegram chat ID",
-        "  To get your chat ID:\n"
-        "    1. Message @userinfobot on Telegram\n"
-        "    2. It replies with your numeric ID\n"
-        "  (Also make sure you've sent a message to your new bot so it can reply to you)",
-    ),
-]
 
 
 def load_env(env_file):
@@ -86,26 +60,137 @@ def save_env(env_file, values):
         f.writelines(lines)
 
 
+def detect_telegram_chat_id(bot_token):
+    """Poll the Telegram bot for a message and extract the chat ID."""
+    print("\n  Detecting your chat ID automatically...")
+    print("  Send any message to your bot in Telegram now.")
+    print("  Waiting", end="", flush=True)
+
+    # Clear any old updates first
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/getUpdates?offset=-1"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if data.get("result"):
+                last_id = data["result"][-1]["update_id"]
+                # Mark it as read
+                urllib.request.urlopen(
+                    f"https://api.telegram.org/bot{bot_token}/getUpdates?offset={last_id + 1}",
+                    timeout=10,
+                )
+    except Exception:
+        pass
+
+    for _ in range(60):  # Wait up to 60 seconds
+        print(".", end="", flush=True)
+        time.sleep(1)
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                results = data.get("result", [])
+                if results:
+                    chat_id = str(results[0]["message"]["chat"]["id"])
+                    user = results[0]["message"]["from"]
+                    name = user.get("first_name", "")
+                    print(f"\n  Found you: {name} (chat ID: {chat_id})")
+                    return chat_id
+        except Exception:
+            continue
+
+    print("\n  Timed out waiting for a message.")
+    return None
+
+
 def configure_env(env_file):
     """Interactively prompt for missing required config values."""
     values = load_env(env_file)
-    missing = [(key, prompt, help_text) for key, prompt, help_text in REQUIRED_CONFIG if not values.get(key)]
 
-    if not missing:
+    steps = []
+    if not values.get("TODOIST_API_TOKEN"):
+        steps.append("TODOIST_API_TOKEN")
+    if not values.get("ANTHROPIC_API_KEY"):
+        steps.append("ANTHROPIC_API_KEY")
+    if not values.get("TELEGRAM_BOT_TOKEN"):
+        steps.append("TELEGRAM_BOT_TOKEN")
+    if not values.get("TELEGRAM_CHAT_ID"):
+        steps.append("TELEGRAM_CHAT_ID")
+
+    if not steps:
         print("[OK] All required config values are set")
         return
 
-    print(f"\n--- Configuration ({len(missing)} value(s) needed) ---\n")
+    print(f"\n--- Configuration ({len(steps)} value(s) needed) ---\n")
     print("Press Enter to skip any value (you can set it later in .env).\n")
 
-    for key, prompt, help_text in missing:
-        print(help_text)
-        val = input(f"  {prompt}: ").strip()
+    # --- Todoist ---
+    if "TODOIST_API_TOKEN" in steps:
+        print("  Opening Todoist developer settings in your browser...")
+        webbrowser.open("https://app.todoist.com/app/settings/integrations/developer")
+        print("  Copy your API token from the page that just opened.")
+        val = input("  Todoist API token: ").strip()
         if val:
-            values[key] = val
-            print(f"  [OK] {key} set\n")
+            values["TODOIST_API_TOKEN"] = val
+            print("  [OK] TODOIST_API_TOKEN set\n")
         else:
-            print(f"  [skipped] You'll need to set {key} in .env before running.\n")
+            print("  [skipped] You'll need to set TODOIST_API_TOKEN in .env before running.\n")
+
+    # --- Anthropic ---
+    if "ANTHROPIC_API_KEY" in steps:
+        print("  Opening Anthropic console in your browser...")
+        webbrowser.open("https://console.anthropic.com/settings/keys")
+        print("  Create an API key and copy it.")
+        val = input("  Anthropic API key: ").strip()
+        if val:
+            values["ANTHROPIC_API_KEY"] = val
+            print("  [OK] ANTHROPIC_API_KEY set\n")
+        else:
+            print("  [skipped] You'll need to set ANTHROPIC_API_KEY in .env before running.\n")
+
+    # --- Telegram bot token ---
+    if "TELEGRAM_BOT_TOKEN" in steps:
+        print("  Opening BotFather in Telegram...")
+        webbrowser.open("https://t.me/BotFather")
+        print("  Steps:")
+        print("    1. Click 'Start' or send /newbot to @BotFather")
+        print("    2. Follow the prompts to name your bot")
+        print("    3. Copy the token it gives you")
+        val = input("  Telegram bot token: ").strip()
+        if val:
+            values["TELEGRAM_BOT_TOKEN"] = val
+            print("  [OK] TELEGRAM_BOT_TOKEN set\n")
+        else:
+            print("  [skipped] You'll need to set TELEGRAM_BOT_TOKEN in .env before running.\n")
+
+    # --- Telegram chat ID (auto-detect if we have the bot token) ---
+    if "TELEGRAM_CHAT_ID" in steps:
+        bot_token = values.get("TELEGRAM_BOT_TOKEN", "")
+        if bot_token:
+            chat_id = detect_telegram_chat_id(bot_token)
+            if chat_id:
+                values["TELEGRAM_CHAT_ID"] = chat_id
+                print("  [OK] TELEGRAM_CHAT_ID set automatically\n")
+            else:
+                print("  Could not detect chat ID automatically.")
+                print("  You can message @userinfobot on Telegram to find your chat ID.")
+                val = input("  Telegram chat ID: ").strip()
+                if val:
+                    values["TELEGRAM_CHAT_ID"] = val
+                    print("  [OK] TELEGRAM_CHAT_ID set\n")
+                else:
+                    print("  [skipped] You'll need to set TELEGRAM_CHAT_ID in .env before running.\n")
+        else:
+            print("  To get your chat ID:")
+            print("    1. Message @userinfobot on Telegram")
+            print("    2. It replies with your numeric ID")
+            val = input("  Telegram chat ID: ").strip()
+            if val:
+                values["TELEGRAM_CHAT_ID"] = val
+                print("  [OK] TELEGRAM_CHAT_ID set\n")
+            else:
+                print("  [skipped] You'll need to set TELEGRAM_CHAT_ID in .env before running.\n")
 
     save_env(env_file, values)
 
@@ -170,19 +255,26 @@ def main():
 
     # Check if any required values are still missing
     values = load_env(env_file)
-    still_missing = [key for key, _, _ in REQUIRED_CONFIG if not values.get(key)]
+    required = ["TODOIST_API_TOKEN", "ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    still_missing = [key for key in required if not values.get(key)]
     if still_missing:
         print("Before running, set these in .env:")
         for key in still_missing:
             print(f"  - {key}")
         print()
 
-    print("To run:")
+    print("To run manually:")
     if os.name == "nt":
         print("  .venv\\Scripts\\activate")
     else:
         print("  source .venv/bin/activate")
     print("  python -m src.main")
+    print()
+    print("To run as a background service (macOS):")
+    print("  python3 install_service.py")
+    print()
+    print("To verify your setup:")
+    print("  python3 verify_setup.py")
     print()
 
 
