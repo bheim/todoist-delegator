@@ -16,13 +16,14 @@ class Delivery:
         self.state = state
         self.telegram = telegram
 
-    async def _upload_output_files(self, output_files: list[str], nickname: str) -> None:
+    async def _upload_output_files(self, output_files: list[str], nickname: str,
+                                   thread_id: int | None = None) -> None:
         """Upload output files via Telegram. Zips if there are many."""
         if not output_files:
             return
         if len(output_files) == 1:
             try:
-                await self.telegram.send_file(output_files[0])
+                await self.telegram.send_file(output_files[0], thread_id=thread_id)
             except Exception as e:
                 print(f"    [warn] Failed to upload file: {e}")
             return
@@ -31,13 +32,13 @@ class Delivery:
             with tempfile.TemporaryDirectory() as tmp:
                 zip_path = Path(tmp) / f"{nickname}-output"
                 shutil.make_archive(str(zip_path), "zip", Path(output_files[0]).parent)
-                await self.telegram.send_file(f"{zip_path}.zip", caption=f"{nickname} output files")
+                await self.telegram.send_file(f"{zip_path}.zip", caption=f"{nickname} output files",
+                                              thread_id=thread_id)
         except Exception as e:
             print(f"    [warn] Failed to zip/upload files: {e}")
-            # Fall back to sending individually
             for f in output_files[:10]:
                 try:
-                    await self.telegram.send_file(f)
+                    await self.telegram.send_file(f, thread_id=thread_id)
                 except Exception:
                     pass
 
@@ -45,6 +46,7 @@ class Delivery:
                               plan_context: dict | None = None) -> None:
         """Send results via Telegram and wait for human to approve before completing."""
         nickname = self.state.get_nickname(task_id)
+        thread_id = self.state.get_thread_id(task_id)
         await self.telegram.send_result(
             task_id=task_id,
             task_title=task_content,
@@ -53,13 +55,14 @@ class Delivery:
             output_files=result.output_files,
             cost_usd=result.cost_usd,
             nickname=nickname,
+            thread_id=thread_id,
         )
 
         # Upload output files via Telegram
-        await self._upload_output_files(result.output_files, nickname)
+        await self._upload_output_files(result.output_files, nickname, thread_id=thread_id)
 
         if result.success:
-            self.state.set_awaiting_review(task_id, plan_context)
+            self.state.set_awaiting_review(task_id, plan_context, result_summary=result.summary)
         else:
             self.state.set_failed(task_id, result.summary)
 

@@ -24,9 +24,11 @@ from .dispatcher import Dispatcher
 from .telegram import TelegramBot
 
 POLL_INTERVAL = 15  # seconds between VPS state checks
-VPS_STATE_PATH = "/root/todoist-delegator/agent-workspace/state.json"
-VPS_WORKSPACE = "/root/todoist-delegator/agent-workspace"
-VPS_HEARTBEAT_PATH = "/root/todoist-delegator/.local-heartbeat"
+VPS_USER = "delegator"
+VPS_BASE = f"/home/{VPS_USER}/todoist-delegator"
+VPS_STATE_PATH = f"{VPS_BASE}/agent-workspace/state.json"
+VPS_WORKSPACE = f"{VPS_BASE}/agent-workspace"
+VPS_HEARTBEAT_PATH = f"{VPS_BASE}/.local-heartbeat"
 
 
 class RemoteState:
@@ -34,7 +36,7 @@ class RemoteState:
 
     def __init__(self, vps_host: str):
         self.vps_host = vps_host
-        self._ssh_target = f"root@{vps_host}"
+        self._ssh_target = f"{VPS_USER}@{vps_host}"
 
     def _ssh(self, command: str, input_data: str | None = None) -> subprocess.CompletedProcess:
         cmd = ["ssh", "-o", "ConnectTimeout=5", self._ssh_target, command]
@@ -143,16 +145,19 @@ async def execute_local_task(task_id: str, entry: dict, config: Config,
         remote.rsync_to_vps(str(task_dir), task_id)
 
         # Update VPS state with results
+        thread_id = entry.get("thread_id")
         if result.needs_human:
             print(f"    Agent needs human help: {result.needs_human}")
             remote.update_task(task_id, {
                 "status": "waiting_for_human",
                 "waiting_message": result.needs_human,
             })
-            await telegram.send_needs_human(task_id, task_content, result.needs_human, nickname=nickname)
+            await telegram.send_needs_human(task_id, task_content, result.needs_human, nickname=nickname, thread_id=thread_id)
         elif result.success:
-            # Get file list from VPS (after rsync)
-            remote.update_task(task_id, {"status": "awaiting_review"})
+            remote.update_task(task_id, {
+                "status": "awaiting_review",
+                "result_summary": result.summary,
+            })
             await telegram.send_result(
                 task_id=task_id,
                 task_title=task_content,
@@ -161,11 +166,12 @@ async def execute_local_task(task_id: str, entry: dict, config: Config,
                 output_files=result.output_files,
                 cost_usd=result.cost_usd,
                 nickname=nickname,
+                thread_id=thread_id,
             )
             # Upload files via Telegram
             for f in result.output_files:
                 try:
-                    await telegram.send_file(f)
+                    await telegram.send_file(f, thread_id=thread_id)
                 except Exception:
                     pass
         else:
@@ -174,7 +180,7 @@ async def execute_local_task(task_id: str, entry: dict, config: Config,
                 "error": result.summary,
                 "phase": "processing",
             })
-            await telegram.send_error(task_id, task_content, result.summary, nickname=nickname)
+            await telegram.send_error(task_id, task_content, result.summary, nickname=nickname, thread_id=thread_id)
 
         print(f"[+] Done with {nickname}")
 
@@ -186,7 +192,7 @@ async def execute_local_task(task_id: str, entry: dict, config: Config,
             "phase": "processing",
         })
         try:
-            await telegram.send_error(task_id, task_content, str(e), nickname=nickname)
+            await telegram.send_error(task_id, task_content, str(e), nickname=nickname, thread_id=entry.get("thread_id"))
         except Exception:
             pass
 

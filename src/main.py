@@ -117,7 +117,8 @@ async def execute_task(task, config, state, planner, router, dispatcher, deliver
     if result.needs_human:
         print(f"    Agent needs human help: {result.needs_human}")
         nickname = state.get_nickname(task.task_id)
-        await telegram.send_needs_human(task.task_id, task.content, result.needs_human, nickname=nickname)
+        tid = state.get_thread_id(task.task_id)
+        await telegram.send_needs_human(task.task_id, task.content, result.needs_human, nickname=nickname, thread_id=tid)
         state.set_waiting_for_human(task.task_id, result.needs_human, plan_context)
         return
 
@@ -139,10 +140,17 @@ async def handle_new_task(task, state, planner, telegram):
     state._save()
     nickname = state.assign_nickname(task.task_id, task.content)
     print(f"    Nickname: {nickname}")
+
+    # Create a forum topic for this task
+    thread_id = await telegram.create_topic(f"{nickname}: {task.content[:80]}")
+    if thread_id:
+        state._data[task.task_id]["thread_id"] = thread_id
+        state._save()
+
     print("    Generating plan...")
     plan_text = await planner.generate_plan(task)
     planner.save_plan(task.task_id, plan_text)
-    await telegram.send_plan(task.task_id, task.content, plan_text, nickname=nickname)
+    await telegram.send_plan(task.task_id, task.content, plan_text, nickname=nickname, thread_id=thread_id)
     state.set_awaiting_approval(task.task_id, plan_text, task_content=task.content)
     print("    Plan sent to Telegram, awaiting approval.")
 
@@ -223,6 +231,31 @@ def _parse_reply(reply: str) -> tuple[str, bool, str | None]:
     return content, is_approval, None
 
 
+def _extract_nickname_prefix(reply: str, state: TaskState) -> tuple[str, str | None]:
+    """Check if message starts with 'nickname: ...' targeting a specific task.
+
+    Returns (remaining_message, task_id) or (original_reply, None).
+    """
+    # Look for "nickname: message" or "nickname message" pattern at start
+    stripped = reply.strip()
+    # Try colon separator first: "go-benheimart: tell me more"
+    if ":" in stripped:
+        prefix, rest = stripped.split(":", 1)
+        prefix = prefix.strip().lower()
+        # Don't match reserved prefixes
+        if prefix in ("new", "vps", "local", "status"):
+            return reply, None
+        # Check if prefix matches an active task nickname
+        active_ids = [
+            tid for tid, entry in state._data.items()
+            if entry.get("status") not in {"completed", "failed"}
+        ]
+        matched = state.find_by_nickname(prefix, active_ids)
+        if matched:
+            return rest.strip() or reply, matched[0]
+    return reply, None
+
+
 def _filter_by_target(task_ids: list[str], target: str | None, state) -> list[str]:
     """Filter task IDs by nickname match (exact then prefix)."""
     if not target:
@@ -239,17 +272,208 @@ async def _disambiguate(state, telegram, task_ids: list[str], action: str) -> No
         name = saved.get("task_content", "")
         lines.append(f"- *{nickname}*: {name}" if name else f"- *{nickname}*")
     first_nick = state.get_nickname(task_ids[0])
-    lines.append(f'\nReply "go {first_nick}" to target a specific task.')
+    lines.append(f'\nPrefix with the name: `{first_nick}: your message`')
+    lines.append(f'Or to approve: `done {first_nick}`')
     await telegram.send_message("\n".join(lines))
 
 
-async def handle_telegram_reply(reply, state, telegram, delivery, planner, poller, chatbot, config):
-    """Route a single Telegram reply to the right task based on current states."""
+async def _handle_targeted_message(reply, task_id, state, telegram, delivery, planner, poller, chatbot, config):
+    """Handle a message explicitly targeted at a specific task (via thread or nickname)."""
+    saved = state.get(task_id)
+    if not saved:
+        await telegram.send_message("Task not found.")
+        return
+    status = saved.get("status")
     content = reply.strip().lower()
+    is_approval = content in APPROVAL_WORDS
+    nickname = state.get_nickname(task_id)
+    tid = saved.get("thread_id")  # forum thread for responses
+
+    if status == "error" and is_approval:
+        phase = saved.get("phase", "planning")
+        if phase == "processing" and saved.get("plan"):
+            plan_context = {
+                "plan": saved["plan"],
+                "use_user_browser": saved.get("use_user_browser", False),
+                "output_dir": saved.get("output_dir"),
+            }
+            target = await _start_execution(task_id, plan_context, state, config)
+            print(f"[+] Retrying errored task {task_id} (processing, target={target})")
+        elif saved.get("source") == "telegram":
+            task_content = saved.get("task_content", "")
+            task = DelegatedTask(
+                task_id=task_id, content=task_content, description="",
+                project_name="", labels=[], comments=[],
+            )
+            state.set_planning(task_id, task_content=task_content)
+            state._data[task_id]["source"] = "telegram"
+            state._save()
+            await handle_new_task(task, state, planner, telegram)
+        else:
+            del state._data[task_id]
+            state._save()
+        await telegram.send_message("Got it — retrying now.", thread_id=tid)
+        return
+
+    if status == "conversing":
+        if is_approval:
+            from_status = saved.get("from_status", "awaiting_approval")
+            plan_context = {
+                "plan": saved.get("plan", ""),
+                "use_user_browser": saved.get("use_user_browser", False),
+                "output_dir": saved.get("output_dir"),
+            }
+            history = saved.get("conversation_history", [])
+            if history:
+                lines = []
+                for m in history:
+                    label = "User" if m["role"] == "user" else "Assistant"
+                    c = m["content"]
+                    if isinstance(c, list):
+                        text = " ".join(
+                            b["text"] for b in c
+                            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                        )
+                    else:
+                        text = c
+                    if text:
+                        lines.append(f"{label}: {text}")
+                plan_context["plan"] += f"\n\n## Refined requirements from conversation\n" + "\n".join(lines)
+            target = await _start_execution(task_id, plan_context, state, config)
+            if target == "local":
+                await telegram.send_message(f"Got it — queued for local execution.", thread_id=tid)
+            else:
+                await telegram.send_message(f"Got it — launching now.", thread_id=tid)
+        else:
+            state.append_conversation(task_id, "user", reply)
+            try:
+                display_text, raw_content = await chatbot.chat(
+                    task_content=saved.get("task_content", ""),
+                    plan=saved.get("plan", ""),
+                    conversation_history=saved.get("conversation_history", []),
+                    from_status=saved.get("from_status", ""),
+                    result_summary=saved.get("result_summary", ""),
+                )
+                state.append_conversation(task_id, "assistant", raw_content)
+                await telegram.send_message(display_text, thread_id=tid)
+            except Exception as e:
+                await telegram.send_message(f"Chat error: {e}\nKeep chatting or say \"go\" to proceed.", thread_id=tid)
+        return
+
+    if status == "awaiting_approval":
+        if is_approval:
+            print(f"[+] Plan approved for task {task_id}")
+            tasks = poller.poll_by_id(task_id)
+            if tasks:
+                task = tasks[0]
+                plan_context = {
+                    "plan": saved["plan"],
+                    "use_user_browser": planner.looks_like_browser_task(task),
+                    "output_dir": planner.extract_output_dir(task),
+                }
+            else:
+                plan_context = {
+                    "plan": saved["plan"],
+                    "use_user_browser": False,
+                    "output_dir": None,
+                }
+            target = await _start_execution(task_id, plan_context, state, config)
+            if target == "local":
+                await telegram.send_message(f"Approved — queued for local execution.", thread_id=tid)
+            else:
+                await telegram.send_message(f"Approved — launching agent now.", thread_id=tid)
+        else:
+            # Feedback — enter conversation
+            task_content = saved.get("task_content", "")
+            if not task_content:
+                tasks = poller.poll_by_id(task_id)
+                task_content = tasks[0].content if tasks else ""
+            plan_context = {"plan": saved.get("plan", ""), "use_user_browser": False, "output_dir": None}
+            state.set_conversing(task_id, "awaiting_approval", plan_context, task_content)
+            state.append_conversation(task_id, "user", reply)
+            try:
+                display_text, raw_content = await chatbot.chat(
+                    task_content=task_content,
+                    plan=saved.get("plan", ""),
+                    conversation_history=[{"role": "user", "content": reply}],
+                    from_status="awaiting_approval",
+                )
+                state.append_conversation(task_id, "assistant", raw_content)
+                await telegram.send_message(display_text, thread_id=tid)
+            except Exception as e:
+                await telegram.send_message(f"Chat error: {e}", thread_id=tid)
+        return
+
+    if status == "waiting_for_human" and is_approval:
+        human_completed = saved.get("waiting_message", "")
+        plan_context = {
+            "plan": saved.get("plan", ""),
+            "use_user_browser": saved.get("use_user_browser", False),
+            "output_dir": saved.get("output_dir"),
+        }
+        await _start_execution(task_id, plan_context, state, config, human_completed=human_completed)
+        await telegram.send_message("Resuming agent.", thread_id=tid)
+        return
+
+    if status == "awaiting_review":
+        if is_approval:
+            print(f"[+] Human approved result for task {task_id} — completing")
+            delivery.complete(task_id)
+            await telegram.send_message("Marked complete.", thread_id=tid)
+            # Delete the topic after completion
+            if tid:
+                await telegram.delete_topic(tid)
+        else:
+            # Enter conversation about results
+            task_content = saved.get("task_content", "")
+            if not task_content:
+                tasks = poller.poll_by_id(task_id)
+                task_content = tasks[0].content if tasks else ""
+            plan_context = {
+                "plan": saved.get("plan", ""),
+                "use_user_browser": saved.get("use_user_browser", False),
+                "output_dir": saved.get("output_dir"),
+            }
+            state.set_conversing(task_id, "awaiting_review", plan_context, task_content)
+            state.append_conversation(task_id, "user", reply)
+            try:
+                display_text, raw_content = await chatbot.chat(
+                    task_content=task_content,
+                    plan=saved.get("plan", ""),
+                    conversation_history=[{"role": "user", "content": reply}],
+                    from_status="awaiting_review",
+                    result_summary=saved.get("result_summary", ""),
+                )
+                state.append_conversation(task_id, "assistant", raw_content)
+                await telegram.send_message(display_text, thread_id=tid)
+            except Exception as e:
+                await telegram.send_message(f"Chat error: {e}", thread_id=tid)
+        return
+
+    await telegram.send_message(f"Task is in `{status}` state — not sure what to do with that message.", thread_id=tid)
+
+
+async def handle_telegram_reply(reply, thread_id, state, telegram, delivery, planner, poller, chatbot, config):
+    """Route a single Telegram reply to the right task based on thread or content."""
+    content = reply.strip().lower()
+
+    # Forum mode: if message is in a task's thread, route directly to that task
+    if thread_id:
+        task_id = state.find_by_thread(thread_id)
+        if task_id:
+            await _handle_targeted_message(reply, task_id, state, telegram, delivery, planner, poller, chatbot, config)
+            return
+        # Message in an unknown thread (maybe General) — fall through to global handling
 
     # Global commands — handled before task-state routing
     if content == "status":
         await _handle_status_command(state, telegram, config)
+        return
+
+    # Check for nickname-targeted message: "nickname: message"
+    remaining, targeted_task_id = _extract_nickname_prefix(reply, state)
+    if targeted_task_id:
+        await _handle_targeted_message(remaining, targeted_task_id, state, telegram, delivery, planner, poller, chatbot, config)
         return
 
     # Direct task creation via "new:" prefix — bypasses Todoist
@@ -389,6 +613,7 @@ async def handle_telegram_reply(reply, state, telegram, delivery, planner, polle
                     plan=saved.get("plan", ""),
                     conversation_history=saved.get("conversation_history", []),
                     from_status=saved.get("from_status", ""),
+                    result_summary=saved.get("result_summary", ""),
                 )
                 state.append_conversation(task_id, "assistant", raw_content)
                 await telegram.send_message(display_text)
@@ -542,6 +767,7 @@ async def handle_telegram_reply(reply, state, telegram, delivery, planner, polle
                     plan=saved.get("plan", ""),
                     conversation_history=[{"role": "user", "content": reply}],
                     from_status="awaiting_review",
+                    result_summary=saved.get("result_summary", ""),
                 )
                 state.append_conversation(task_id, "assistant", raw_content)
                 await telegram.send_message(display_text)
@@ -626,7 +852,8 @@ async def main():
             state.set_error(task.task_id, str(e), phase, plan_context)
             try:
                 nickname = state.get_nickname(task.task_id)
-                await telegram.send_error(task.task_id, task.content, str(e), nickname=nickname)
+                tid = state.get_thread_id(task.task_id)
+                await telegram.send_error(task.task_id, task.content, str(e), nickname=nickname, thread_id=tid)
             except Exception:
                 pass
 
@@ -644,9 +871,10 @@ async def main():
             # When VPS_HOST is set, VPS handles Telegram and Todoist — we only do worker duties
             if not remote:
                 # Single place to check Telegram replies — routes to the right handler
-                reply = await telegram.poll_for_reply(timeout=2.0)
-                if reply:
-                    await handle_telegram_reply(reply, state, telegram, delivery, planner, poller, chatbot, config)
+                result = await telegram.poll_for_reply(timeout=2.0)
+                if result:
+                    reply_text, reply_thread_id = result
+                    await handle_telegram_reply(reply_text, reply_thread_id, state, telegram, delivery, planner, poller, chatbot, config)
 
             # Poll for new/resumable tasks (skip when VPS handles ingestion)
             if not remote:
@@ -674,7 +902,8 @@ async def main():
                         state.set_error(task.task_id, str(e), "planning")
                         try:
                             nickname = state.get_nickname(task.task_id)
-                            await telegram.send_error(task.task_id, task.content, str(e), nickname=nickname)
+                            tid = state.get_thread_id(task.task_id)
+                            await telegram.send_error(task.task_id, task.content, str(e), nickname=nickname, thread_id=tid)
                         except Exception:
                             pass
 

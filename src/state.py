@@ -102,6 +102,18 @@ class TaskState:
             return entry.get("nickname", task_id[:8])
         return task_id[:8]
 
+    def find_by_thread(self, thread_id: int) -> str | None:
+        """Find a task ID by its Telegram forum thread_id."""
+        for tid, entry in self._data.items():
+            if entry.get("thread_id") == thread_id:
+                return tid
+        return None
+
+    def get_thread_id(self, task_id: str) -> int | None:
+        """Get the forum thread_id for a task."""
+        entry = self._data.get(task_id)
+        return entry.get("thread_id") if entry else None
+
     def find_by_nickname(self, target: str, task_ids: list[str] | None = None) -> list[str]:
         """Find task IDs matching a nickname (exact first, then prefix).
 
@@ -124,7 +136,7 @@ class TaskState:
     def _carry_forward(self, task_id: str, entry: dict[str, Any]) -> None:
         """Preserve nickname, task_content, and source when overwriting a state entry."""
         old = self._data.get(task_id, {})
-        for key in ("nickname", "task_content", "source"):
+        for key in ("nickname", "task_content", "source", "execution_target", "result_summary", "thread_id"):
             if key not in entry and key in old:
                 entry[key] = old[key]
 
@@ -215,12 +227,15 @@ class TaskState:
             if entry.get("status") == "pending_local"
         }
 
-    def set_awaiting_review(self, task_id: str, plan_context: dict | None = None) -> None:
+    def set_awaiting_review(self, task_id: str, plan_context: dict | None = None,
+                            result_summary: str = "") -> None:
         entry: dict[str, Any] = {"status": "awaiting_review"}
         if plan_context:
             entry["plan"] = plan_context["plan"]
             entry["use_user_browser"] = plan_context.get("use_user_browser", False)
             entry["output_dir"] = plan_context.get("output_dir")
+        if result_summary:
+            entry["result_summary"] = result_summary
         self._carry_forward(task_id, entry)
         self._data[task_id] = entry
         self._save()

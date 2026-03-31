@@ -35,7 +35,7 @@ class Chatbot:
         self.model = MODEL_MAP.get(config.agent_model, config.agent_model)
 
     async def chat(self, task_content: str, plan: str, conversation_history: list[dict],
-                   from_status: str) -> str:
+                   from_status: str, result_summary: str = "") -> str:
         """Send a message in an ongoing conversation and return the assistant's reply.
 
         conversation_history should already include the latest user message.
@@ -46,6 +46,8 @@ class Chatbot:
             context_parts.append(f"Current plan:\n{plan}")
         if from_status == "awaiting_review":
             context_parts.append("The agent has already run and produced results. The user is reviewing them.")
+            if result_summary:
+                context_parts.append(f"Agent results:\n{result_summary}")
         else:
             context_parts.append("The agent has not run yet. The user is reviewing the plan.")
 
