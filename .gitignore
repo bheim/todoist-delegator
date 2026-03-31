@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 CLAUDE.md
 *.log
+.DS_Store
+.local-heartbeat

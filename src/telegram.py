@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 
 from telegram import Bot
 
@@ -33,56 +34,73 @@ class TelegramBot:
             msg_id = msg.message_id
         return msg_id
 
-    async def send_plan(self, task_id: str, task_title: str, plan_text: str) -> int:
+    async def send_file(self, file_path: str, caption: str = "") -> None:
+        """Send a file via Telegram (up to 50MB)."""
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return
+        with open(path, "rb") as f:
+            await self.bot.send_document(
+                chat_id=self.chat_id,
+                document=f,
+                caption=caption[:1024] if caption else path.name,
+            )
+
+    async def send_plan(self, task_id: str, task_title: str, plan_text: str,
+                        nickname: str = "") -> int:
         """Send a plan for approval. Returns message_id for reply tracking."""
+        name_line = f"Name: *{nickname}*\n" if nickname else ""
         text = (
             f"*New task plan*\n"
             f"Task: {_escape_md(task_title)}\n"
-            f"ID: `{task_id}`\n\n"
+            f"{name_line}\n"
             f"{plan_text}\n\n"
-            f'Reply "go" to approve, or send feedback to refine the plan.'
+            f'Reply "go{" " + nickname if nickname else ""}" to approve, or send feedback to refine.'
         )
-        # Flush pending updates before sending so poll_for_reply only sees new messages
-        await self._flush_updates()
         return await self.send_message(text)
 
-    async def send_needs_human(self, task_id: str, task_title: str, message: str) -> int:
+    async def send_needs_human(self, task_id: str, task_title: str, message: str,
+                              nickname: str = "") -> int:
         """Send a NEEDS_HUMAN notification. Returns message_id for reply tracking."""
+        name_line = f"Name: *{nickname}*\n" if nickname else ""
         text = (
             f"*Action needed*\n"
             f"Task: {_escape_md(task_title)}\n"
-            f"ID: `{task_id}`\n\n"
+            f"{name_line}\n"
             f"{message}\n\n"
-            f'Reply "done" when you\'ve completed this action.'
+            f'Reply "done{" " + nickname if nickname else ""}" when you\'ve completed this action.'
         )
-        await self._flush_updates()
         return await self.send_message(text)
 
     async def send_result(self, task_id: str, task_title: str, success: bool,
-                          summary: str, output_files: list[str], cost_usd: float) -> None:
+                          summary: str, output_files: list[str], cost_usd: float,
+                          nickname: str = "") -> None:
         """Send task results."""
         status = "Completed" if success else "Failed"
+        name_line = f"Name: *{nickname}*\n" if nickname else ""
         file_list = "\n".join(f"- `{f}`" for f in output_files) if output_files else "(none)"
         text = (
             f"*Result: {status}*\n"
             f"Task: {_escape_md(task_title)}\n"
-            f"ID: `{task_id}`\n\n"
+            f"{name_line}\n"
             f"*Summary:*\n{summary}\n\n"
             f"*Output files:*\n{file_list}\n\n"
             f"*Cost:* ${cost_usd:.4f}\n\n"
         )
         if success:
-            text += 'Please review the work. Reply "done" to mark complete, or send feedback to have the agent try again.'
-        await self._flush_updates()
+            text += f'Reply "done{" " + nickname if nickname else ""}" to complete, or send feedback to refine.'
         await self.send_message(text)
 
-    async def send_error(self, task_id: str, task_title: str, error: str) -> None:
-        """Send an error notification."""
+    async def send_error(self, task_id: str, task_title: str, error: str,
+                         nickname: str = "") -> None:
+        """Send an error notification with retry option."""
+        name_line = f"Name: *{nickname}*\n" if nickname else ""
         text = (
             f"*Error*\n"
             f"Task: {_escape_md(task_title)}\n"
-            f"ID: `{task_id}`\n\n"
-            f"{error}"
+            f"{name_line}\n"
+            f"{error}\n\n"
+            f'Reply "retry{" " + nickname if nickname else ""}" to try again.'
         )
         await self.send_message(text)
 

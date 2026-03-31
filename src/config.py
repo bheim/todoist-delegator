@@ -31,6 +31,7 @@ class Config:
     agent_model: str = "haiku"
     agent_max_turns: int = 50
     working_dir: str = "./agent-workspace"
+    vps_host: str = ""  # Only needed for local worker mode (e.g. "5.78.71.233")
 
     _required_fields: list[str] = field(
         default_factory=lambda: [
@@ -66,4 +67,5 @@ def load_config() -> Config:
         working_dir=os.path.abspath(
             os.getenv("WORKING_DIR", "./agent-workspace")
         ),
+        vps_host=os.getenv("VPS_HOST", ""),
     )
